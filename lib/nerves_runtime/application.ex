@@ -25,10 +25,11 @@ defmodule Nerves.Runtime.Application do
 
   defp target_children(_target) do
     kernel_opts = Application.get_env(:nerves_runtime, :kernel, [])
+    syslog_opts = Application.get_env(:nerves_runtime, :syslog, [])
 
     [
       KmsgTailer,
-      SyslogTailer,
+      {SyslogTailer, syslog_opts},
       {Kernel.UEvent, kernel_opts},
       Init
     ]

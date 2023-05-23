@@ -267,7 +267,18 @@ To make this handle hangs, you'll want to enable a hardware watchdog.
 
 Operating system-level messages from `/dev/log` and `/proc/kmsg`, forwarding
 them to `Logger` with an appropriate level to match the syslog priority parsed
-out of the message.
+out of the message. The level is configurable with the `log_level` option (default is `:error`).
+
+The options are one of: [:emergency, :alert, :critical, :error, :warning, :notice, :informational, :debug]
+
+The `log_level` is treated as the minimum level to be logged. For example, if `:notice` is selected,
+then only levels of `:notice` or above (`:error`, `:alert`, `:critical`) will be logged.
+
+Configure with:
+```
+config :nerves_runtime, :syslog,
+  log_level: :error
+```
 
 ## uevent/udev events
 

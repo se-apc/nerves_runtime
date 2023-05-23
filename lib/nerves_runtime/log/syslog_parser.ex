@@ -120,6 +120,18 @@ defmodule Nerves.Runtime.Log.SyslogParser do
   defp severity_name(6), do: :informational
   defp severity_name(7), do: :debug
 
+  def severity_code(:emergency), do: 0
+  def severity_code(:alert), do: 1
+  def severity_code(:critical), do: 2
+  def severity_code(:error), do: 3
+  def severity_code(:warning), do: 4
+  def severity_code(:warn), do: severity_code(:warning)
+  def severity_code(:notice), do: 5
+  def severity_code(:informational), do: 6
+  def severity_code(:info), do: severity_code(:informational)
+  def severity_code(:debug), do: 7
+  def severity_code(_), do: severity_code(:error)
+
   @doc """
   Convert severity to an Elixir logger level
   """
