@@ -1,76 +1,78 @@
 defmodule Nerves.Runtime.Kernel.UEvent do
   use GenServer
   require Logger
-  alias Nerves.Runtime.Device
 
+  @moduledoc """
+  GenServer that captures Linux uevent messages and passes them up to Elixir.
+  """
+
+  defmodule State do
+    @moduledoc false
+
+    defstruct [:port, :autoload, :use_system_registry]
+  end
+
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
+  @impl GenServer
   def init(opts) do
-    autoload = if opts[:autoload_modules] != nil, do: opts[:autoload_modules], else: true
-    send(self(), :discover)
-    executable = :code.priv_dir(:nerves_runtime) ++ '/uevent'
+    autoload = Keyword.get(opts, :autoload_modules, true)
+    use_system_registry = Keyword.get(opts, :use_system_registry, true)
+
+    executable = :code.priv_dir(:nerves_runtime) ++ '/nerves_runtime'
 
     port =
       Port.open({:spawn_executable, executable}, [
-        {:args, []},
+        {:arg0, "uevent"},
         {:packet, 2},
         :use_stdio,
         :binary,
         :exit_status
       ])
 
-    {:ok, %{port: port, autoload: autoload}}
+    {:ok,
+     %State{
+       port: port,
+       autoload: autoload,
+       use_system_registry: use_system_registry
+     }}
   end
 
-  def handle_info(:discover, s) do
-    Device.discover()
+  @impl GenServer
+  def handle_info({port, {:data, message}}, %State{port: port} = s) do
+    {action, scope_no_state, kvmap} = :erlang.binary_to_term(message)
+    _ = registry(action, [:state | scope_no_state], kvmap, s)
     {:noreply, s}
   end
 
-  def handle_info({_, {:data, <<?n, message::binary>>}}, s) do
-    msg = :erlang.binary_to_term(message)
-    handle_port(msg, s)
-  end
+  def registry("add", scope, kvmap, s) do
+    # Logger.debug("uevent add: #{inspect(scope)}")
 
-  defp handle_port({:uevent, _uevent, kv}, s) do
-    event =
-      Enum.reduce(kv, %{}, fn str, acc ->
-        [k, v] = String.split(str, "=", parts: 2)
-        k = String.downcase(k)
-        Map.put(acc, k, v)
-      end)
+    if s.autoload, do: modprobe(kvmap)
 
-    case Map.get(event, "devpath", "") do
-      "/devices" <> _path -> registry(event, s)
-      _ -> :noop
+    if s.use_system_registry do
+      if subsystem = Map.get(kvmap, "subsystem") do
+        _ =
+          SystemRegistry.update_in(subsystem_scope(subsystem), fn v ->
+            v = if is_nil(v), do: [], else: v
+            [scope | v]
+          end)
+
+        :ok
+      end
+
+      SystemRegistry.update(scope, kvmap)
     end
-
-    {:noreply, s}
   end
 
-  def registry(%{"action" => "add", "devpath" => devpath} = event, s) do
-    attributes = Map.drop(event, ["action", "devpath"])
-    scope = scope(devpath)
-    # Logger.debug "UEvent Add: #{inspect scope}"
-    if subsystem = Map.get(event, "subsystem") do
-      SystemRegistry.update_in(subsystem_scope(subsystem), fn v ->
-        v = if is_nil(v), do: [], else: v
-        [scope | v]
-      end)
-    end
+  def registry("remove", scope, kvmap, %State{use_system_registry: true}) do
+    # Logger.debug("uevent remove: #{inspect(scope)}")
+    _ = SystemRegistry.delete(scope)
 
-    if s.autoload, do: modprobe(event)
-    SystemRegistry.update(scope, attributes)
-  end
-
-  def registry(%{"action" => "remove", "devpath" => devpath} = event, _) do
-    scope = scope(devpath)
-    # Logger.debug "UEvent Remove: #{inspect scope}"
-    SystemRegistry.delete(scope)
-
-    if subsystem = Map.get(event, "subsystem") do
+    if subsystem = Map.get(kvmap, "subsystem") do
       SystemRegistry.update_in(subsystem_scope(subsystem), fn v ->
         v = if is_nil(v), do: [], else: v
         {_, scopes} = Enum.split_with(v, fn v -> v == scope end)
@@ -79,24 +81,15 @@ defmodule Nerves.Runtime.Kernel.UEvent do
     end
   end
 
-  def registry(%{"action" => "change"} = event, s) do
-    # Logger.debug "UEvent Change: #{inspect event}"
-    raw = Map.drop(event, ["action"])
-
-    Map.put(raw, "action", "remove")
-    |> registry(s)
-
-    Map.put(raw, "action", "add")
-    |> registry(s)
+  def registry("move", new_scope, %{"devpath_old" => devpath_old}, %State{
+        use_system_registry: true
+      }) do
+    # Logger.debug("uevent move: #{inspect(scope(devpath_old))} -> #{inspect(new_scope)}")
+    SystemRegistry.move(scope(devpath_old), new_scope)
   end
 
-  def registry(%{"action" => "move", "devpath" => new, "devpath_old" => old}, _) do
-    # Logger.debug "UEvent Move: #{inspect scope(old)} -> #{inspect scope(new)}"
-    SystemRegistry.move(scope(old), scope(new))
-  end
-
-  def registry(event, _) do
-    Logger.debug("UEvent Unhandled: #{inspect(event)}")
+  def registry(_action, _scope, _kvmap, _s) do
+    # Logger.debug("uevent unhandled: #{inspect(action)}")
   end
 
   defp scope("/" <> devpath) do
@@ -112,7 +105,10 @@ defmodule Nerves.Runtime.Kernel.UEvent do
   end
 
   defp modprobe(%{"modalias" => modalias}) do
-    System.cmd("modprobe", [modalias], stderr_to_stdout: true)
+    # There's not necessarily a kernel module to be loaded for many
+    # modalias values. We don't know without trying, though.
+    _ = System.cmd("/sbin/modprobe", [modalias], stderr_to_stdout: true)
+    :ok
   end
 
   defp modprobe(_), do: :noop

@@ -1,57 +1,185 @@
 defmodule Nerves.Runtime.KV do
   @moduledoc """
-  Key Value Storage for firmware vairables provided by fwup
+  Key Value storage for firmware variables provided by fwup.
 
-  KV provides access to metadata variables set by fwup.
-  It can be used to obtain information such as the active
-  firmware slot, where the application data partition
-  is located, etc.
+  KV provides functionality to read and modify firmware metadata set by fwup.
+  The firmware metadata contains information such as the active firmware
+  slot, where the application data partition is located, etc. The firmware
+  metadata store is a simple key-value store where both keys and values are
+  stored as strings.
 
-  Values are stored in two ways.
-  * Values that do not pertain to a specific firmware slot
-  For example:
-    `"nerves_fw_active" => "a"`
+  The firmware metadata is stored in the U-boot environment block stored at
+  the beginning of the disk outside of actual partitions. It is not stored
+  redundantly, and it can be susceptible to corruption in case of power
+  failure during writes. For this reason, it is recommended to use the
+  firmware metadata with caution. The access patterns in this module lower
+  the risk of corruption, and risk can be lowered further by storing as
+  little data as possible in the firmware metadata.
 
-  * Values that pertain to a specific firmware slot
-  For Example:
-    `"a.nerves_fw_author" => "The Nerves Team"`
+  `UBootEnv` can alternatively be used for more direct access to the firmware
+  metadata. However, since KV utilizes caching of the firmware metadata, you
+  should use either KV or UBootEnv, not both.
 
-  You can find values for just the active firmware slot by
-  using get_active and get_all_active. The result of these
-  functions will trim the firmware slot (`"a."` or `"b."`)
-  from the leading characters of the keys returned.
+  ## Examples
 
-  ## Technical Information
+  Getting all firmware metadata:
 
-  Nerves.Runtime.KV uses a non-replicated U-Boot environment block for storing 
-  firmware and provisioning information. It has the following format:
+      iex> Nerves.Runtime.KV.get_all()
+      %{
+        "a.nerves_fw_application_part0_devpath" => "/dev/mmcblk0p3",
+        "a.nerves_fw_application_part0_fstype" => "ext4",
+        "a.nerves_fw_application_part0_target" => "/root",
+        "a.nerves_fw_architecture" => "arm",
+        "a.nerves_fw_author" => "The Nerves Team",
+        "a.nerves_fw_description" => "",
+        "a.nerves_fw_misc" => "",
+        "a.nerves_fw_platform" => "rpi0",
+        "a.nerves_fw_product" => "test_app",
+        "a.nerves_fw_uuid" => "d9492bdb-94de-5288-425e-2de6928ef99c",
+        "a.nerves_fw_vcs_identifier" => "",
+        "a.nerves_fw_version" => "0.1.0",
+        "b.nerves_fw_application_part0_devpath" => "/dev/mmcblk0p3",
+        "b.nerves_fw_application_part0_fstype" => "ext4",
+        "b.nerves_fw_application_part0_target" => "/root",
+        "b.nerves_fw_architecture" => "arm",
+        "b.nerves_fw_author" => "The Nerves Team",
+        "b.nerves_fw_description" => "",
+        "b.nerves_fw_misc" => "",
+        "b.nerves_fw_platform" => "rpi0",
+        "b.nerves_fw_product" => "test_app",
+        "b.nerves_fw_uuid" => "4e08ad59-fa3c-5498-4a58-179b43cc1a25",
+        "b.nerves_fw_vcs_identifier" => "",
+        "b.nerves_fw_version" => "0.1.1",
+        "nerves_fw_active" => "b",
+        "nerves_fw_devpath" => "/dev/mmcblk0",
+        "nerves_serial_number" => ""
+      }
 
-    * CRC32 of bytes 4 through to the end
-    * `"<key>=<value>\0"` for each key/value pair
-    * `"\0"` an empty key/value pair to terminate the list. 
-      This looks like "\0\0" when you're viewing the file in a hex editor.
-    * Filler bytes to the end of the environment block. These are usually `0xff`.
+  Parts of the firmware metadata are global, while others pertain to a
+  specific firmware slot. This is indicated by the key - data which describes
+  firmware of a specific slot have keys prefixed with the name of the
+  firmware slot. In the above example, `"nerves_fw_active"` and
+  `"nerves_serial_number"` are global, while `"a.nerves_fw_version"` and
+  `"b.nerves_fw_version"` apply to the "a" and "b" firmware slots,
+  respectively.
 
-  The U-Boot environment configuration is loaded from /etc/fw_env.config.
-  If you are using OTP >= 21, the contents of the U-Boot environment will be
-  read directly from the device. This addresses an issue with parsing
-  multi-line values from a call to `fw_printenv`.
+  It is also possible to get firmware metadata that only pertains to the
+  currently active firmware slot:
+
+      iex> Nerves.Runtime.KV.get_all_active()
+      %{
+        "nerves_fw_application_part0_devpath" => "/dev/mmcblk0p3",
+        "nerves_fw_application_part0_fstype" => "ext4",
+        "nerves_fw_application_part0_target" => "/root",
+        "nerves_fw_architecture" => "arm",
+        "nerves_fw_author" => "The Nerves Team",
+        "nerves_fw_description" => "",
+        "nerves_fw_misc" => "",
+        "nerves_fw_platform" => "rpi0",
+        "nerves_fw_product" => "test_app",
+        "nerves_fw_uuid" => "4e08ad59-fa3c-5498-4a58-179b43cc1a25",
+        "nerves_fw_vcs_identifier" => "",
+        "nerves_fw_version" => "0.1.1"
+      }
+
+  Note that `get_all_active/0` strips out the `a.` and `b.` prefixes.
+
+  Further, the two functions `get/1` and `get_active/1` allow you to get a
+  specific key from the firmware metadata. `get/1` requires specifying the
+  entire key name, while `get_active/1` will prepend the slot prefix for you:
+
+      iex> Nerves.Runtime.KV.get("nerves_fw_active")
+      "b"
+      iex> Nerves.Runtime.KV.get("b.nerves_fw_uuid")
+      "4e08ad59-fa3c-5498-4a58-179b43cc1a25"
+      iex> Nerves.Runtime.KV.get_active("nerves_fw_uuid")
+      "4e08ad59-fa3c-5498-4a58-179b43cc1a25"
+
+  Aside from reading values from the KV store, it is also possible to write
+  new values to the firmware metadata. New values may either have unique keys,
+  in which case they will be added to the firmware metadata, or re-use a key,
+  in which case they will overwrite the current value with that key:
+
+      iex> :ok = Nerves.Runtime.KV.put("my_firmware_key", "my_value")
+      iex> :ok = Nerves.Runtime.KV.put("nerves_serial_number", "my_new_serial_number")
+      iex> Nerves.Runtime.KV.get("my_firmware_key")
+      "my_value"
+      iex> Nerves.Runtime.KV.get("nerves_serial_number")
+      "my_new_serial_number"
+
+  It is possible to write a collection of values at once, in order to
+  minimize number of writes:
+
+      iex> :ok = Nerves.Runtime.KV.put(%{"one_key" => "one_val", "two_key" => "two_val"})
+      iex> Nerves.Runtime.KV.get("one_key")
+      "one_val"
+
+  Lastly, `put_active/1` and `put_active/2` allow you to write firmware metadata to the
+  currently active firmware slot without specifying the slot prefix yourself:
+
+      iex> :ok = Nerves.Runtime.KV.put_active("nerves_fw_misc", "Nerves is awesome")
+      iex> Nerves.Runtime.KV.get_active("nerves_fw_misc")
+      "Nerves is awesome"
   """
+
   use GenServer
   require Logger
 
-  @config "/etc/fw_env.config"
+  @typedoc """
+  The KV store is a string -> string map
+
+  Since the KV store is backed by things like the U-Boot environment blocks,
+  the keys and values can't be just any string. For example, characters with
+  the value `0` (i.e., `NULL`) are disallowed. The `=` sign is also disallowed
+  in keys. Values may have embedded new lines. In general, it's recommended to
+  stick with ASCII values to avoid causing trouble when working with C programs
+  and U-Boot which also access the variables.
+  """
+  @type string_map :: %{String.t() => String.t()}
+
+  @doc """
+  Initialize the KV store and return its contents
+
+  This will be called on boot and should return all persisted key/value pairs.
+  The results will be cached and if a change should be persisted, `c:put/1` will
+  be called with the update.
+
+  The `opts` parameter is currently unused, but may supply configuration
+  options in the future.
+  """
+  @callback init(opts :: any) :: initial_state :: string_map()
+
+  @doc """
+  Persist the updated KV pairs
+
+  The KV map contains the KV pairs returned by `c:init/1` with any changes made
+  by users of `Nerves.Runtime.KV`.
+  """
+  @callback put(state :: string_map()) :: :ok | {:error, reason :: any()}
+
+  alias __MODULE__
+
+  mod =
+    if Nerves.Runtime.target() != "host" do
+      KV.UBootEnv
+    else
+      KV.Mock
+    end
+
+  @default_mod mod
 
   @doc """
   Start the KV store server
   """
-  def start_link(kv \\ "") do
-    GenServer.start_link(__MODULE__, kv, name: __MODULE__)
+  @spec start_link(any()) :: GenServer.on_start()
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
   @doc """
   Get the key for only the active firmware slot
   """
+  @spec get_active(String.t()) :: String.t() | nil
   def get_active(key) do
     GenServer.call(__MODULE__, {:get_active, key})
   end
@@ -59,6 +187,7 @@ defmodule Nerves.Runtime.KV do
   @doc """
   Get the key regardless of firmware slot
   """
+  @spec get(String.t()) :: String.t() | nil
   def get(key) do
     GenServer.call(__MODULE__, {:get, key})
   end
@@ -66,6 +195,7 @@ defmodule Nerves.Runtime.KV do
   @doc """
   Get all key value pairs for only the active firmware slot
   """
+  @spec get_all_active() :: string_map()
   def get_all_active() do
     GenServer.call(__MODULE__, :get_all_active)
   end
@@ -73,24 +203,49 @@ defmodule Nerves.Runtime.KV do
   @doc """
   Get all keys regardless of firmware slot
   """
+  @spec get_all() :: string_map()
   def get_all() do
     GenServer.call(__MODULE__, :get_all)
   end
 
-  # GenServer API
-
-  def init(_kv) do
-    with {:ok, config} <- read_config(@config),
-         {dev_name, dev_offset, env_size} <- parse_config(config),
-         {:ok, kv} <- load_kv(dev_name, dev_offset, env_size) do
-      {:ok, kv}
-    else
-      _error ->
-        exec = System.find_executable("fw_printenv")
-        {:ok, load_kv(exec)}
-    end
+  @doc """
+  Write a key-value pair to the firmware metadata
+  """
+  @spec put(String.t(), String.t()) :: :ok
+  def put(key, value) do
+    GenServer.call(__MODULE__, {:put, %{key => value}})
   end
 
+  @doc """
+  Write a collection of key-value pairs to the firmware metadata
+  """
+  @spec put(string_map()) :: :ok
+  def put(kv) do
+    GenServer.call(__MODULE__, {:put, kv})
+  end
+
+  @doc """
+  Write a key-value pair to the active firmware slot
+  """
+  @spec put_active(String.t(), String.t()) :: :ok
+  def put_active(key, value) do
+    GenServer.call(__MODULE__, {:put_active, %{key => value}})
+  end
+
+  @doc """
+  Write a collection of key-value pairs to the active firmware slot
+  """
+  @spec put_active(string_map()) :: :ok
+  def put_active(kv) do
+    GenServer.call(__MODULE__, {:put_active, kv})
+  end
+
+  @impl GenServer
+  def init(opts) do
+    {:ok, mod().init(opts)}
+  end
+
+  @impl GenServer
   def handle_call({:get_active, key}, _from, s) do
     {:reply, active(key, s), s}
   end
@@ -109,54 +264,17 @@ defmodule Nerves.Runtime.KV do
     {:reply, s, s}
   end
 
-  defp load_kv(nil), do: %{}
-
-  defp load_kv(exec) do
-    case System.cmd(exec, []) do
-      {result, 0} ->
-        parse_kv(result)
-
-      {result, code} ->
-        Logger.warn("#{inspect(__MODULE__)} failed to load fw env (#{code}): #{result}")
-        %{}
-    end
+  def handle_call({:put, kv}, _from, s) do
+    {reply, s} = do_put(kv, s)
+    {:reply, reply, s}
   end
 
-  # OTP 21 FTW
-  # Load the UBoot env from the source
-  defp load_kv(dev_name, dev_offset, env_size) do
-    {:ok, fd} = File.open(dev_name)
-    {:ok, bin} = :file.pread(fd, dev_offset, env_size)
-    File.close(fd)
-    <<expected_crc::little-size(32), tail::binary>> = bin
-    actual_crc = :erlang.crc32(tail)
+  def handle_call({:put_active, kv}, _from, s) do
+    {reply, s} =
+      Map.new(kv, fn {key, value} -> {"#{active(s)}.#{key}", value} end)
+      |> do_put(s)
 
-    if actual_crc == expected_crc do
-      kv =
-        tail
-        |> :binary.bin_to_list()
-        |> Enum.chunk_by(fn b -> b == 0 end)
-        |> Enum.reject(&(&1 == [0]))
-        |> Enum.take_while(&(&1 != [0, 0]))
-        |> parse_kv()
-
-      {:ok, kv}
-    else
-      {:error, :invalid_crc}
-    end
-  end
-
-  def parse_kv(kv) when is_list(kv) do
-    kv
-    |> Enum.map(&to_string(&1))
-    |> Enum.map(&String.split(&1, "=", parts: 2))
-    |> Enum.map(fn [k, v] -> {k, v} end)
-    |> Enum.into(%{})
-  end
-
-  def parse_kv(kv) when is_binary(kv) do
-    String.split(kv, "\n", trim: true)
-    |> parse_kv()
+    {:reply, reply, s}
   end
 
   defp active(s), do: Map.get(s, "nerves_fw_active", "")
@@ -173,25 +291,14 @@ defmodule Nerves.Runtime.KV do
     |> Enum.into(%{})
   end
 
-  defp read_config(file) do
-    case File.read(file) do
-      {:ok, config} -> {:ok, config}
-      _ -> {:error, :no_config}
+  defp do_put(kv, s) do
+    case mod().put(kv) do
+      :ok -> {:ok, Map.merge(s, kv)}
+      error -> {error, s}
     end
   end
 
-  defp parse_config(config) do
-    [config] =
-      config
-      |> String.split("\n", trim: true)
-      |> Enum.map(&String.trim/1)
-      |> Enum.reject(&String.starts_with?(&1, "#"))
-
-    [dev_name, dev_offset, env_size | _] = String.split(config, "\t", trim: true)
-
-    {dev_name, parse_int(dev_offset), parse_int(env_size)}
+  defp mod() do
+    Application.get_env(:nerves_runtime, :modules)[__MODULE__] || @default_mod
   end
-
-  defp parse_int(<<"0x", hex_int::binary()>>), do: String.to_integer(hex_int, 16)
-  defp parse_int(decimal_int), do: String.to_integer(decimal_int)
 end

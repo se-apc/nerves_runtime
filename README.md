@@ -1,6 +1,6 @@
 # nerves_runtime
 
-[![Build Status](https://travis-ci.org/nerves-project/nerves_runtime.svg?branch=master)](https://travis-ci.org/nerves-project/nerves_runtime)
+[![CircleCI](https://circleci.com/gh/nerves-project/nerves_runtime.svg?style=svg)](https://circleci.com/gh/nerves-project/nerves_runtime)
 [![Hex version](https://img.shields.io/hexpm/v/nerves_runtime.svg "Hex version")](https://hex.pm/packages/nerves_runtime)
 
 `nerves_runtime` is a core component of Nerves. It contains applications and
@@ -14,7 +14,7 @@ Here are its features:
 * Device reboot and shutdown
 * A small Linux kernel `uevent` application for capturing hardware change events
   and more
-* IEx helpers to make life better when working from the IEx prompt
+* Device serial numbers
 
 The following sections describe the features in more detail. For more
 information, see the [hex docs](https://hexdocs.pm/nerves_runtime).
@@ -32,12 +32,12 @@ assume that the system is already initialized before they start. To set up
 3. Ensure that `:nerves_runtime` is at the beginning of the `init:` list in
    your `config/config.exs`:
 
-    ```elixir
-    config :shoehorn,
-      overlay_path: "",
-      init: [:nerves_runtime, :other_app1, :other_app2],
-      app: :your_app
-    ```
+```elixir
+config :shoehorn,
+  overlay_path: "",
+  init: [:nerves_runtime, :other_app1, :other_app2],
+  app: :your_app
+```
 
 ### Kernel Modules
 
@@ -48,6 +48,15 @@ this feature by configuring `autoload: false` in your application configuration:
 ```elixir
 config :nerves_runtime, :kernel,
   autoload_modules: false
+```
+
+`nerves_runtime` can optionally report device insertions and removals through
+[SystemRegistry](https://github.com/nerves-project/system_registry). This is
+currently the default, but you can disable it via configuration:
+
+```elixir
+config :nerves_runtime, :kernel,
+  use_system_registry: false
 ```
 
 ## Filesystem Initialization
@@ -102,13 +111,18 @@ Key                 | Build Environment Variable   | Example Value    | Descript
 ------------------- | ---------------------------- | ---------------- | -----------
 `nerves_fw_active`  | N/A                          | `"a"`            | This key holds the prefix that identifies the active firmware metadata. In this example, all keys starting with `"a."` hold information about the running firmware.
 `nerves_fw_devpath` | `NERVES_FW_DEVPATH`          | `"/dev/mmcblk0"` | This is the primary storage device for the firmware.
-`serial_number`     | N/A                          | `"12345abc"`     | This is a text serial number. See [Serial numbers](#serial_numbers) for details.
+`nerves_serial_number` | N/A                       | `"12345abc"`     | This is a text serial number. See [Serial numbers](#serial_numbers) for details.
+`nerves_fw_validated` | N/A                        | `0`              | Set to "1" to indicate that the currently running firmware is valid. (Only supported on some platforms)
+`nerves_fw_autovalidate` | N/A                     | `1`              | Set to "1" to indicate that firmware updates are valid without any additional checks.  (Only supported on some platforms)
+`upgrade_available` | N/A                          | `0`              | If using the U-Boot bootloader AND U-Boot's `bootcount` feature, then the `upgrade_available` variable is used instead of `nerves_fw_validated` (it has the opposite meaning)
+`bootcount`         | N/A                          | `1`              | If using the U-Boot bootloader AND U-Boot's `bootcount` feature, then this is the number of times an unvalidated firmware has been booted.
+`bootlimit`         | N/A                          | `1`              | If using the U-Boot bootloader AND U-Boot's `bootcount` feature, then this is the max number of tries for unvalidated firmware.
 
 Firmware-specific Nerves metadata includes the following:
 
 Key                                   | Example Value     | Description
 :------------------------------------ | :---------------- | :----------
-`nerves_fw_application_part0_devpath` | `"/dev/mmcblkp3"` | The block device that contains the application partition
+`nerves_fw_application_part0_devpath` | `"/dev/mmcblk0p3"` | The block device that contains the application partition
 `nerves_fw_application_part0_fstype`  | `"ext4"`          | The application partition's filesystem type
 `nerves_fw_application_part0_target`  | `"/root"`         | Where to mount the application partition
 `nerves_fw_architecture`              | `"arm"`           | The processor architecture (Not currently used)
@@ -134,7 +148,7 @@ time. Depending on your project, you may prefer to set them using a customized
 `fwup.conf` configuration file instead.
 
 The `fwup -m` value shows the key that you'll see if you run `fwup -m -i
-<project.fw>` to extract the firmware metadata from the `.fw` file.
+project.fw` to extract the firmware metadata from the `.fw` file.
 
 Key in `Nerves.Runtime`               | Key in `mix.exs`            | Build Environment Variable            | Key in `fwup -m`
 ------------------------------------- | --------------------------- | ------------------------------------- | ----------------
@@ -171,63 +185,83 @@ run:
 iex> Nerves.Runtime.revert
 ```
 
-Going back to previous versions of firmware is an important topic for building
-devices that can survive buggy firmware updates without manual intervention.
-Making this work well involves non-Elixir components like bootloaders. This
-feature isn't intended to be bulletproof, but it certainly can get you out of
-bad situations.
+Running this command manually is useful in development. Production use requires
+more work to protect against faulty upgrades.
 
-One important use case is to be able to remotely update a device and have it
-automatically revert its firmware after a timeout or if it can't reach the
-network. A common requirement is to handle crashes and hangs. The noraml strategy for
-implementing this to have the device allow one boot of new firmware and then to
-mark it "valid" if code gets to a good point (like connect to a server). If
-something goes wrong, then the next reboot reverts back to the original
-firmware. If you're running a scriptable bootloader like U-boot, it's
-best to have the logic implemented there to minimize the code that must work.
-Here's a simple alternative:
+### Assisted firmware validation and automatic revert
 
-1. After upgrading firmware, save that the next boot is the first one.
-1. On the reboot, if this is the first boot, record that the boot happened and
+Nerves firmware updates protect against update corruption and power loss
+midway into the update procedure. However, what happens if the firmware update
+contains bad code that hangs the device or breaks something important like
+networking? Some Nerves systems support tentative runs of new firmware and if
+something goes wrong, they'll revert back.
+
+At a high level, this involves some additional code from the developer that
+knows what constitutes "working". This could be "is it possible to connect to
+the firmware update server within 5 minutes of boot?"
+
+Here's the process:
+
+1. New firmware is installed in the normal manner. The `Nerves.Runtime.KV`
+   variable, `nerves_fw_validated` is set to 0. (The systems `fwup.conf` does
+   this)
+2. The system reboots like normal.
+3. The device starts a five minute reboot timer (your code needs to do this if
+   you want to catch hangs or super-slow boots)
+4. The application attempts to make a connection to the firmware update server.
+5. On a good connection, the application sets `nerves_fw_validated` to 1 by
+   calling `Nerves.Runtime.validate_firmware/0` and cancels the reboot timer.
+6. On error, the reboot timer failing, or a hardware watchdog timeout, the
+   system reboots. The bootloader reverts to the previous firmware.
+
+Some Nerves systems support a KV variable called `nerves_fw_autovalidate`. The
+intention of this variable was to make that system support scenarios that
+require validate and ones that don't. If the system supports this variable then
+you should make sure that it is set to 0 (either via a custom fwup.conf or via
+the provisioning hooks for writing serial numbers to MicroSD cards). Support for
+the `nerves_fw_autovalidate` variable will likely go away in the future as steps
+are made to make automatic revert on bad firmware a default feature of Nerves
+rather than an add-on.
+
+### U-Boot assisted automatic revert
+
+U-Boot provides a `bootcount` feature that can be used to try out new firmware
+and revert it if it fails. At a high level, it works similar to logic just
+described except that it can attempt a new firmware more than once if desired. This
+can help if validating a firmware image depends on factors out of your control and
+you want a few tries to happen before giving up.
+
+To use this, you need to enable the following U-Boot configuration items:
+
+```
+CONFIG_BOOTCOUNT_LIMIT=y
+CONFIG_BOOTCOUNT_ENV=y
+```
+
+See the U-Boot documentation for more information. The gist is to have your
+`bootcmd` handle normal booting and then add an `altbootcmd` to revert the
+firmware. The firmware update should set the `upgrade_available` U-Boot
+environment variable to `"1"` to indicate that boot counting should start.
+`Nerves.Runtime.validate_firmware/0` knows about `upgrade_available`, so when
+you call it to indicate that the firmware is ok, it will set `upgrade_available`
+back to `"0"` and reset `"bootcount"`.
+
+### Best effort automatic revert
+
+Unfortunately, the bootloader for platforms like the Raspberry Pi makes it
+difficult to implement the above mechanism. The following strategy cannot
+protect against kernel and early boot issues, but it can still provide value:
+
+1. Upgrade firmware the normal way. Record that the next boot will be the first
+   one in the application data partition.
+2. On the reboot, if this is the first one, record that the boot happened and
    revert the firmware with `reboot: false`.  If this is not the first boot,
    carry on.
-1. When you're happy with the new firmware, revert the firmware again with
+3. When you're happy with the new firmware, revert the firmware again with
    `reboot: false`. I.e., revert the revert. It is critical that `revert` is
    only called once.
 
-To make this handle issues that result in hangs, you'll want to enable a
-hardware watchdog.
-
-Note that this simple mechanism doesn't help with any failure that happens
-before the tentative revert step.
-
-## IEx helpers
-
-The `Nerves.Runtime.Helpers` module provides a number of functions that are
-useful when working at the IEx prompt on a target. They include:
-
-* `cmd/1` - runs a shell command and prints the output
-* `dmesg/0` - dump kernel messages
-* `hex/1` - inspects a value in hexadecimal mode
-* `reboot/0` - reboots gracefully
-* `reboot!/0` - reboots immediately
-
-More information is available in the module docs for `Nerves.Runtime.Helpers`
-and through `h/1`.
-
-Prior to Nerves 1.0.0, the IEx helpers weren't loaded by default in the new
-project generator. To use them, run the following:
-
-```elixir
-iex> use Nerves.Runtime.Helpers
-```
-
-If you expect to use them frequently, add them to your `.iex.exs` on the
-target by running:
-
-```elixir
-iex> Nerves.Runtime.Helpers.install
-```
+To make this handle hangs, you'll want to enable a hardware watchdog.
 
 ## Operating system log collection
 
@@ -235,24 +269,175 @@ Operating system-level messages from `/dev/log` and `/proc/kmsg`, forwarding
 them to `Logger` with an appropriate level to match the syslog priority parsed
 out of the message.
 
-You can disable this feature (e.g. when running in CI) by configuring the
-following option:
+## uevent/udev events
+
+`nerves_runtime`receives and processes UEvents from the Linux kernel. The processed
+events' data is stored in the `SystemRegistry`. So you need to obtain a current
+`SystemRegistry` map before querying the data. E.g.:
 
 ```elixir
-# config.exs
-config :nerves_runtime, enable_syslog: false
+sr = SystemRegistry.match(:_)
+```
+
+### Accessing uevent data
+
+`nerves_runtime` stores all device data categorized by subsystem under
+`[:state, "subsystems"]`: This map uses the subsystem name as key. It's value
+is a list of device paths.
+
+The list of currently known subsystems can be obtained using:
+
+```elixir
+iex> Map.keys(sr[:state]["subsystems"])
+["mdio_bus", "remoteproc", "regulator", "iio", "mem", "soc", "queues",
+ "scsi_host", "clocksource", "mmc", "scsi_device", "mmc_host", "i2c", "bsg",
+ "dma", "workqueue", "misc", "platform", "leds", "spi_master", "gpio", "scsi",
+ "vc", "usb", "vtconsole", "watchdog", "scsi_disk", "uio", "bdi", "hidg", "udc",
+ "mbox", "cpu", "nvmem", "net", "spi", "clockevents", "block", "mmc_rpmb",
+ "tty", "i2c-dev", "spidev", "pwm"]
+```
+
+The list of devices paths for a specific subsystem can be obtained as follows:
+
+```elixir
+iex> sr[:state]["subsystems"]["mem"]
+[
+  [:state, "devices", "virtual", "mem", "random"],
+  [:state, "devices", "virtual", "mem", "null"],
+  [:state, "devices", "virtual", "mem", "urandom"],
+  [:state, "devices", "virtual", "mem", "full"],
+  [:state, "devices", "virtual", "mem", "kmsg"],
+  [:state, "devices", "virtual", "mem", "zero"],
+  [:state, "devices", "virtual", "mem", "mem"]
+]
+```
+
+> **WARNING:** Compared to the original device paths used by Linux the device
+> path lists contain an additional `:state` prefix. This allows for a direct
+> usage as keypath into `SystemRegistry` to access their properties.
+
+To access the properties of one of the devices above simply use it's device path
+with `get_in` on `SystemRegistry`:
+
+```elixir
+iex> get_in(sr, [:state, "devices", "virtual", "mem", "zero"])
+%{
+  "devmode" => "0666",
+  "devname" => "zero",
+  "major" => "1",
+  "minor" => "5",
+  "subsystem" => "mem"
+}
+```
+
+> **WARNING:** Please note that the returned map might contain non-binary values
+> for non-leaf devices!
+
+```elixir
+iex> get_in(sr,  [:state, "devices", "platform", "ocp", "481d8000.mmc", "mmc_host", "mmc1", "mmc1:0001", "block", "mmcblk1"])
+%{
+  "devname" => "mmcblk1",
+  "devtype" => "disk",
+  "major" => "179",
+  "minor" => "8",
+  "mmcblk1boot0" => %{
+    "devname" => "mmcblk1boot0",
+    "devtype" => "disk",
+    "major" => "179",
+    "minor" => "16",
+    "subsystem" => "block"
+  },
+  "mmcblk1boot1" => %{
+    "devname" => "mmcblk1boot1",
+    "devtype" => "disk",
+    "major" => "179",
+    "minor" => "24",
+    "subsystem" => "block"
+  },
+  "subsystem" => "block"
+}
+```
+
+The non-binary values are actually the child devices of the device accessed. If
+you only need the actual device properties you need to filter out non-binary
+elements.
+
+```elixir
+iex> get_in(sr,  [:state, "devices", "platform", "ocp", "481d8000.mmc", "mmc_host", "mmc1", "mmc1:0001", "block", "mmcblk1"])
+  |> Enum.filter(fn {key, value} -> is_binary(value) end)
+  |> Map.new()
+%{
+  "devname" => "mmcblk1",
+  "devtype" => "disk",
+  "major" => "179",
+  "minor" => "8",
+  "subsystem" => "block"
+}
 ```
 
 ## Serial numbers
 
-Nerves systems support several methods for assigning serial numbers to devices.
-By default serial numbers are derived using board-specific identifiers.
-Currently, no one place exists that can be queried for the serial number.
-However, many people are using the `serial_number` key in the U-Boot environment
-block to store a serial number for their device. This location is not "secure"
-against a determined person who wants to clone a device. However, it is good
-enough for many use cases and is available on all platforms supported by Nerves.
+Finding the serial number of a device is both hardware specific and influenced
+by you and your organization's choices for assigning them (or not). Programs
+should call `Nerves.Runtime.serial_number/0` to get the serial number.
+
+Nerves systems all come with some default way of getting a serial number for a
+device. This strategy will likely work for a while, but may not meet your needs
+when it comes to production. Nerves uses
+[`boardid`](https://github.com/nerves-project/boardid/) to read serial numbers
+and it can be customized via its `/etc/boardid.config` file. See `boardid` for
+the mechanisms available. If none of `boardid`'s mechanisms work for you, please
+consider filing an issue or making a PR, since our history has been that
+organizations tend to use similar mechanisms and it's likely someone else will
+use it too.
+
+As a word of caution, many Nerves users write serial numbers in the U-Boot
+environment block under the key `nerves_serial_number`. This is supported and
+documentation exists for it in many places. While it's very convenient, it has
+drawbacks - like it's easily modified. It's definitely not the only mechanism.
+The `boardid.config` file supports trying multiple ways of getting a serial
+number to handle hardware changing over the course of development.
 
 See
 [embedded-elixir](https://embedded-elixir.com/post/2018-06-15-serial_number/)
-for how to assign serial numbers to devices.
+for how to assign serial numbers to devices using the U-Boot environment block
+way.
+
+## Using nerves_runtime in tests
+
+Applications that depend on `nerves_runtime` for accessing provisioning
+information from the `Nerves.Runtime.KV` can mock the contents with the included
+`Nerves.Runtime.KV.Mock` module through the Application config:
+
+```elixir
+config :nerves_runtime, Nerves.Runtime.KV.Mock, %{"key" => "value"}
+```
+
+You can also create your own module based on the `Nerves.Runtime.KV` behavior
+and set it to be used in the Application config. In most situations, the
+provided `Nerves.Runtime.KV.Mock` should be sufficient, though this would be
+helpful in cases where you might need to generate the initial state at runtime
+instead:
+
+```elixir
+defmodule MyApp.KV.Mock do
+  @behaviour Nerves.Runtime.KV
+
+  @impl Nerves.Runtime.KV
+  def init(_opts) do
+    # initial state
+    %{
+      "howdy" => "partner",
+      "dynamic" => some_runtime_calc_function()
+    }
+  end
+
+  @impl Nerves.Runtime.KV
+  def put(_map), do: :ok
+end
+
+# Then in config.exs
+config :nerves_runtime, :modules, [
+  {Nerves.Runtime.KV, MyApp.KV.Mock}
+]
+```

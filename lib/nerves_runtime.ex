@@ -1,9 +1,11 @@
 defmodule Nerves.Runtime do
   require Logger
 
-  alias Nerves.Runtime.OutputLogger
+  alias Nerves.Runtime.{KV, OutputLogger}
 
+  # These are provided by all official Nerves system images
   @revert_fw_path "/usr/share/fwup/revert.fw"
+  @boardid_path "/usr/bin/boardid"
 
   @typedoc """
   Options for `Nerves.Runtime.revert/1`.
@@ -23,7 +25,7 @@ defmodule Nerves.Runtime do
   `erlinit.config`'s `--graceful-powerdown` setting (likely 10 seconds) then
   the system will be hard rebooted.
   """
-  @spec reboot() :: :ok
+  @spec reboot() :: no_return()
   def reboot(), do: logged_shutdown("reboot")
 
   @doc """
@@ -33,7 +35,7 @@ defmodule Nerves.Runtime do
   `erlinit.config`'s `--graceful-powerdown` setting (likely 10 seconds) then
   the system will be hard rebooted.
   """
-  @spec poweroff() :: :ok
+  @spec poweroff() :: no_return()
   def poweroff(), do: logged_shutdown("poweroff")
 
   @doc """
@@ -42,7 +44,7 @@ defmodule Nerves.Runtime do
   Note: this is different than :erlang.halt(), which exits BEAM, and may end up
   rebooting the device if `erlinit.config` settings allow reboot on exit.
   """
-  @spec halt() :: :ok
+  @spec halt() :: no_return()
   def halt(), do: logged_shutdown("halt")
 
   @doc """
@@ -50,40 +52,168 @@ defmodule Nerves.Runtime do
 
   This requires a specially constructed fw file.
   """
-  @spec revert([revert_options]) :: :ok | {:error, reason :: any}
+  @spec revert([revert_options]) :: :ok | {:error, reason :: any} | no_return()
   def revert(opts \\ []) do
     reboot? = if opts[:reboot] != nil, do: opts[:reboot], else: true
 
     if File.exists?(@revert_fw_path) do
-      cmd("fwup", [@revert_fw_path, "-t", "revert", "-d", "/dev/rootdisk0"], :info)
-      if reboot?, do: reboot()
+      {_, 0} = cmd("fwup", [@revert_fw_path, "-t", "revert", "-d", "/dev/rootdisk0"], :info)
+
+      if reboot? do
+        reboot()
+      else
+        :ok
+      end
     else
       {:error, "Unable to locate revert firmware at path: #{@revert_fw_path}"}
     end
   end
 
   @doc """
+  Return the device's serial number
+
+  Serial number storage is device-specific and configurable. Serial numbers can
+  be programmed in one-time programmable locations like in CPU ROM or
+  cryptographic elements. They can also be in rewritable locations like a
+  U-Boot environment block.
+
+  Nerves uses the [`boardid`](https://github.com/nerves-project/boardid/) by
+  default (set `:boardid_path` key in the application environment to another
+  program to override). Boardid uses the `/etc/boardid.config` file to
+  determine how to read the serial number. Official Nerves systems provide
+  reasonable default mechanisms for getting started. Override this file in your
+  application's `rootfs_overlay` to customize it.
+
+  This function never raises. If a serial number isn't available for any
+  reason, it will return a serial number of `"unconfigured"`.
+  """
+  @spec serial_number() :: String.t()
+  def serial_number() do
+    boardid_path = Application.get_env(:nerves_runtime, :boardid_path, @boardid_path)
+    {serial, 0} = System.cmd(boardid_path, [])
+    String.trim(serial)
+  catch
+    _, _ ->
+      "unconfigured"
+  end
+
+  @doc """
+  Mark the running firmware as valid
+
+  A device cannot receive a new firmware if the current one has not been validated.
+  In the official Nerves systems, this typically happens automatically. If you are
+  handling the firmware validation in your app, then this function can be used as
+  a helper to mark firmware as valid.
+
+  For systems that support automatic reverting, if the firmware is not marked as
+  valid, then the next reboot will cause a revert to the old firmware
+  """
+  @spec validate_firmware() :: :ok
+  def validate_firmware() do
+    # If using U-Boot's bootcount feature, set those variables as well
+    if KV.get("upgrade_available") do
+      KV.put(%{"upgrade_available" => "0", "bootcount" => "0", "nerves_fw_validated" => "1"})
+    else
+      KV.put("nerves_fw_validated", "1")
+    end
+  end
+
+  @doc """
+  Return whether the firmware has been marked as valid
+
+  Since "valid" means that the next boot will run the same firmware, this also
+  returns `true` if firmware validation isn't in use.
+
+  See `validate_firmware/0` for more information.
+  """
+  @spec firmware_valid?() :: boolean()
+  def firmware_valid?() do
+    case validation_status() do
+      :validated -> true
+      :unvalidated -> false
+      :unknown -> true
+    end
+  end
+
+  defp validation_status() do
+    with :unknown <- u_boot_bootcount_status() do
+      nerves_validated_status()
+    end
+  end
+
+  defp u_boot_bootcount_status() do
+    case KV.get("upgrade_available") do
+      "0" -> :validated
+      "1" -> :unvalidated
+      _ -> :unknown
+    end
+  end
+
+  defp nerves_validated_status() do
+    case KV.get("nerves_fw_validated") do
+      "1" -> :validated
+      "0" -> :unvalidated
+      _ -> :unknown
+    end
+  end
+
+  @doc """
   Run system command and log output into logger.
+
+  NOTE: Unlike System.cmd/3, this does not raise if the executable isn't found
   """
   @spec cmd(binary(), [binary()], :debug | :info | :warn | :error | :return) ::
           {Collectable.t(), exit_status :: non_neg_integer()}
-  def cmd(cmd, params, :return), do: System.cmd(cmd, params, stderr_to_stdout: true)
+  def cmd(cmd, params, log_level_or_return) do
+    case System.find_executable(cmd) do
+      nil ->
+        Logger.error(
+          "Executable #{cmd} was not found. The Nerves System must be fixed to include it!"
+        )
 
-  def cmd(cmd, params, out),
+        {"", 255}
+
+      cmd_path ->
+        run_cmd(cmd_path, params, log_level_or_return)
+    end
+  end
+
+  defp run_cmd(cmd, params, :return), do: System.cmd(cmd, params, stderr_to_stdout: true)
+
+  defp run_cmd(cmd, params, out),
     do: System.cmd(cmd, params, into: OutputLogger.new(out), stderr_to_stdout: true)
 
+  @doc """
+  Return whether the application was built for either the host or the target
+  """
+  @spec target() :: String.t()
+  def target() do
+    target = Application.get_env(:nerves_runtime, :target)
+    if target == "host", do: "host", else: "target"
+  end
+
   # private helpers
-
+  @dialyzer {:nowarn_function, logged_shutdown: 1}
   defp logged_shutdown(cmd) do
-    Logger.info("#{__MODULE__} : device told to #{cmd}")
+    try do
+      Logger.info("#{__MODULE__} : device told to #{cmd}")
 
-    # Invoke the appropriate command to tell erlinit that a shutdown
-    # of the Erlang VM is imminent. Once this returns, the Erlang has
-    # about 10 seconds to exit unless `--graceful-powerdown` is used
-    # in the `erlinit.config` to modify the timeout.
-    cmd(cmd, [], :info)
+      # Invoke the appropriate command to tell erlinit that a shutdown of the
+      # Erlang VM is imminent. Once this returns, the Erlang has about 10
+      # seconds to exit unless `--graceful-powerdown` is used in the
+      # `erlinit.config` to modify the timeout.
+      {_, 0} = cmd(cmd, [], :info)
 
-    # Gracefully shut down
-    :init.stop()
+      # Start a graceful shutdown
+      :ok = :init.stop()
+
+      # `:init.stop()` is asynchronous, so sleep longer than it takes to avoid
+      # returning.
+      Process.sleep(60_000)
+    after
+      # If anything unexpected happens, call :erlang.halt() to avoid getting
+      # stuck in a state where the application thinks it's done.
+      :erlang.halt()
+    end
   end
 end

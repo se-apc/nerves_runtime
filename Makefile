@@ -1,4 +1,13 @@
-# Variables to override
+# Makefile for building port binaries
+#
+# Makefile targets:
+#
+# all/install   build and install the port binaries
+# clean         clean build products and intermediates
+#
+# Variables to override:
+#
+# MIX_APP_PATH  path to the build directory
 #
 # CC            C compiler
 # CROSSCOMPILE	crosscompiler prefix, if any
@@ -8,6 +17,9 @@
 # ERL_EI_LIBDIR path to libei.a (Required for crosscompile)
 # LDFLAGS	linker flags for linking all binaries
 # ERL_LDFLAGS	additional linker flags for projects referencing Erlang libraries
+
+PREFIX = $(MIX_APP_PATH)/priv
+BUILD  = $(MIX_APP_PATH)/obj
 
 # Check that we're on a supported build platform
 ifeq ($(CROSSCOMPILE),)
@@ -19,22 +31,10 @@ ifeq ($(CROSSCOMPILE),)
         $(warning this should be done automatically.)
         $(warning .)
         $(warning Skipping C compilation unless targets explicitly passed to make.)
-	DEFAULT_TARGETS = priv
+	DEFAULT_TARGETS = $(PREFIX)
     endif
 endif
-DEFAULT_TARGETS ?= priv priv/uevent priv/log_tailer
-
-# Look for the EI library and header files
-# For crosscompiled builds, ERL_EI_INCLUDE_DIR and ERL_EI_LIBDIR must be
-# passed into the Makefile.
-ifeq ($(ERL_EI_INCLUDE_DIR),)
-ERL_ROOT_DIR = $(shell erl -eval "io:format(\"~s~n\", [code:root_dir()])" -s init stop -noshell)
-ifeq ($(ERL_ROOT_DIR),)
-   $(error Could not find the Erlang installation. Check to see that 'erl' is in your PATH)
-endif
-ERL_EI_INCLUDE_DIR = "$(ERL_ROOT_DIR)/usr/include"
-ERL_EI_LIBDIR = "$(ERL_ROOT_DIR)/usr/lib"
-endif
+DEFAULT_TARGETS ?= $(PREFIX) $(PREFIX)/nerves_runtime
 
 # Set Erlang-specific compile and linker flags
 ERL_CFLAGS ?= -I$(ERL_EI_INCLUDE_DIR)
@@ -51,33 +51,47 @@ CFLAGS += -std=gnu99
 
 ifeq ($(origin CROSSCOMPILE), undefined)
 SUDO_ASKPASS ?= /usr/bin/ssh-askpass
-SUDO ?= sudo
+SUDO ?= true
 
 # If not cross-compiling, then run sudo and suid the port binary
 # so that it's possible to debug
 update_perms = \
+	echo "Not crosscompiling. To test locally, the port binary needs extra permissions.";\
+	echo "Set SUDO=sudo to set permissions. The default is to skip this step.";\
+	echo "SUDO_ASKPASS=$(SUDO_ASKPASS)";\
+	echo "SUDO=$(SUDO)";\
 	SUDO_ASKPASS=$(SUDO_ASKPASS) $(SUDO) -- sh -c 'chown root:root $(1); chmod +s $(1)'
 else
 # If cross-compiling, then permissions need to be set some build system-dependent way
 update_perms =
 endif
 
-.PHONY: all clean
+calling_from_make:
+	mix compile
 
-all: $(DEFAULT_TARGETS)
+all: install
 
-%.o: %.c
+install: $(BUILD) $(DEFAULT_TARGETS)
+
+$(BUILD)/%.o: src/%.c
+	@echo " CC $(notdir $@)"
 	$(CC) -c $(ERL_CFLAGS) $(CFLAGS) -o $@ $<
 
-priv:
-	mkdir -p priv
-
-priv/uevent: src/uevent.o src/erlcmd.o
+$(PREFIX)/nerves_runtime: $(BUILD)/nerves_runtime.o $(BUILD)/uevent.o $(BUILD)/kmsg_tailer.o
+	@echo " LD $(notdir $@)"
 	$(CC) $^ $(ERL_LDFLAGS) $(LDFLAGS) -o $@
 	$(call update_perms, $@)
 
-priv/log_tailer: src/log_tailer.o
-	$(CC) $^ $(ERL_LDFLAGS) $(LDFLAGS) -o $@
+$(PREFIX) $(BUILD):
+	mkdir -p $@
+
+mix_clean:
+	$(RM) $(PREFIX)/nerves_runtime $(BUILD)/*.o
 
 clean:
-	rm -f priv/uevent priv/log_tailer src/*.o
+	mix clean
+
+.PHONY: all clean mix_clean calling_from_make install
+
+# Don't echo commands unless the caller exports "V=1"
+${V}.SILENT:

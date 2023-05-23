@@ -1,6 +1,10 @@
 defmodule Nerves.Runtime.OutputLogger do
   defstruct [:level]
+  @type t :: %__MODULE__{level: Logger.level()}
 
+  @moduledoc false
+
+  @spec new(Logger.level()) :: t()
   def new(level) do
     %__MODULE__{level: level}
   end
@@ -14,7 +18,7 @@ defmodule Nerves.Runtime.OutputLogger do
       fn
         :ok, {:cont, logs} ->
           logs
-          |> String.split("\n")
+          |> String.split("\n", trim: true)
           |> Enum.each(&Logger.bare_log(level, fn -> &1 end))
 
         :ok, _ ->
