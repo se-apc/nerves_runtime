@@ -15,12 +15,12 @@ defmodule Nerves.Runtime.Log.SyslogTailer do
   Start the local syslog GenServer.
   """
   @spec start_link(any()) :: GenServer.on_start()
-  def start_link(_args) do
-    GenServer.start_link(__MODULE__, [], name: __MODULE__)
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
   @impl GenServer
-  def init(_args) do
+  def init(opts) do
     # Blindly try to remove an old file just in case it exists from a previous run
     _ = File.rm(@syslog_path)
 
@@ -30,22 +30,26 @@ defmodule Nerves.Runtime.Log.SyslogTailer do
     # All processes should be able to log messages
     File.chmod!(@syslog_path, 0o666)
 
-    {:ok, log_port}
+    log_level = Keyword.get(opts, :log_level) |> SyslogParser.severity_code()
+
+    {:ok, %{log_port: log_port, log_level: log_level}}
   end
 
   @impl GenServer
-  def handle_info({:udp, log_port, _, 0, raw_entry}, log_port) do
+  def handle_info({:udp, log_port, _, 0, raw_entry}, state = %{log_port: log_port, log_level: log_level}) do
     case SyslogParser.parse(raw_entry) do
       {:ok, %{facility: facility, severity: severity, message: message}} ->
-        level = SyslogParser.severity_to_logger(severity)
+        if severity <= log_level do
+          level = SyslogParser.severity_to_logger(severity)
 
-        Logger.bare_log(
-          level,
-          message,
-          module: __MODULE__,
-          facility: facility,
-          severity: severity
-        )
+          Logger.bare_log(
+            level,
+            message,
+            module: __MODULE__,
+            facility: facility,
+            severity: severity
+          )
+        end
 
       _ ->
         # This is unlikely to ever happen, but if a message was somehow
@@ -54,6 +58,6 @@ defmodule Nerves.Runtime.Log.SyslogTailer do
         Logger.warn("Malformed syslog report: #{inspect(raw_entry)}")
     end
 
-    {:noreply, log_port}
+    {:noreply, state}
   end
 end
