@@ -162,7 +162,7 @@ defmodule Nerves.Runtime do
 
   NOTE: Unlike System.cmd/3, this does not raise if the executable isn't found
   """
-  @spec cmd(binary(), [binary()], :debug | :info | :warn | :error | :return) ::
+  @spec cmd(binary(), [binary()], :debug | :info | :warning | :error | :return) ::
           {Collectable.t(), exit_status :: non_neg_integer()}
   def cmd(cmd, params, log_level_or_return) do
     case System.find_executable(cmd) do

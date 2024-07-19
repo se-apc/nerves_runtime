@@ -139,7 +139,7 @@ defmodule Nerves.Runtime.Log.SyslogParser do
   def severity_to_logger(severity) when severity in [:emergency, :alert, :critical, :error],
     do: :error
 
-  def severity_to_logger(severity) when severity == :warning, do: :warn
+  def severity_to_logger(severity) when severity == :warning, do: :warning
   def severity_to_logger(severity) when severity in [:notice, :informational], do: :info
   def severity_to_logger(severity) when severity == :debug, do: :debug
 end
